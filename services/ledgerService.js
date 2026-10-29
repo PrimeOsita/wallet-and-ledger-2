@@ -16,7 +16,7 @@ async function runInTransaction(fn) {
   }
 }
 
-// Internal accounts like platform_cash or payout_clearing, created on first use
+
 async function getSystemAccount(name, type, currency, session) {
   const code = `${name}:${currency}`;
   return LedgerAccount.findOneAndUpdate(
@@ -77,7 +77,7 @@ async function getAccountBalance(accountId, session) {
   const debits = total('debit');
   const credits = total('credit');
 
-  // Assets and expenses grow with debits; liabilities, revenue and equity with credits
+
   return ['asset', 'expense'].includes(account.type) ? debits - credits : credits - debits;
 }
 

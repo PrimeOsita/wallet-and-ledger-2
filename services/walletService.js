@@ -4,6 +4,7 @@ const LedgerEntry = require('../models/ledgerEntry');
 const ledger = require('./ledgerService');
 const generateReference = require('../utils/generateReference');
 const { AppError } = require('../middleware/errorhandler');
+const Payout = require('../models/payout');
 
 async function createWallet(userId, currency) {
   try {
@@ -28,7 +29,53 @@ async function getWallet(userId, walletId) {
   if (!wallet) throw new AppError(404, 'Wallet not found');
   return wallet;
 }
+async function listWallets(userId, { includeClosed = false } = {}) {
+  const filter = { user: userId };
+  if (!includeClosed) filter.status = { $ne: 'closed' };
+  return Wallet.find(filter).sort({ createdAt: -1 }).lean();
+}
 
+async function updateWallet(userId, walletId, { label }) {
+  const wallet = await Wallet.findOneAndUpdate(
+    { _id: walletId, user: userId, status: { $ne: 'closed' } },
+    { $set: { label } },
+    { new: true }
+  );
+  if (!wallet) throw new AppError(404, 'Wallet not found');
+  return wallet;
+}
+
+async function closeWallet(userId, walletId) {
+  return ledger.runInTransaction(async (session) => {
+    const wallet = await Wallet.findOne({
+      _id: walletId,
+      user: userId,
+      status: { $ne: 'closed' }
+    }).session(session);
+    if (!wallet) throw new AppError(404, 'Wallet not found');
+
+    if (wallet.balanceMinor !== 0) {
+      throw new AppError(422, 'Transfer or withdraw the remaining balance before closing', 'BALANCE_NOT_ZERO');
+    }
+
+    const pending = await Payout.exists({
+      wallet: wallet._id,
+      status: { $in: ['queued', 'processing', 'sent'] }
+    }).session(session);
+    if (pending) {
+      throw new AppError(422, 'A payout is still in progress for this wallet', 'PAYOUT_IN_PROGRESS');
+    }
+
+    // The balance check is repeated in the filter, so a deposit landing at the same moment can't slip past
+    const closed = await Wallet.findOneAndUpdate(
+      { _id: wallet._id, balanceMinor: 0 },
+      { $set: { status: 'closed', closedAt: new Date() }, $inc: { version: 1 } },
+      { new: true, session }
+    );
+    if (!closed) throw new AppError(409, 'Wallet changed, please retry');
+    return closed;
+  });
+}
 // The only function that changes a balance. delta > 0 credits, delta < 0 debits.
 async function changeBalance(walletId, delta, session, { allowInactive = false } = {}) {
   const filter = { _id: walletId };
@@ -137,5 +184,27 @@ async function getStatement(userId, walletId, { limit = 20, before } = {}) {
     nextCursor: entries.length === pageSize ? entries[entries.length - 1]._id : null
   };
 }
+async function devFund({ userId, walletId, amountMinor }) {
+  const reference = generateReference('dev');
+  return ledger.runInTransaction(async (session) => {
+    const wallet = await Wallet.findOne({ _id: walletId, user: userId }).session(session);
+    if (!wallet) throw new AppError(404, 'Wallet not found');
 
-module.exports = { createWallet, getWallet, changeBalance, deposit, transfer, getStatement };
+    await deposit(
+      {
+        walletId: wallet._id,
+        amountMinor,
+        currency: wallet.currency,
+        reference,
+        description: 'Test funding',
+        metadata: { dev: true }
+      },
+      session
+    );
+
+    const updated = await Wallet.findById(wallet._id).session(session);
+    return { reference, balanceMinor: updated.balanceMinor, currency: updated.currency };
+  });
+}
+
+module.exports = { createWallet, getWallet, changeBalance, deposit, transfer, getStatement, listWallets, updateWallet, closeWallet, devFund };
